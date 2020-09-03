@@ -170,14 +170,24 @@ func main() {
 	}
 
 	// Get the sapling activation height from the RPC
-	saplingHeight, blockHeight, chainName, branchID, err := common.GetSaplingInfo(rpcClient)
+	saplingHeight, blockHeight, chainName, branchID, difficulty, longestchain, notarized, err := common.GetSaplingInfo(rpcClient)
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"error": err,
 		}).Warn("Unable to get sapling activation height")
 	}
 
-	log.Info("Got sapling height ", saplingHeight, " chain ", chainName, " branchID ", branchID)
+	log.Info("Got sapling height ", saplingHeight, " chain ", chainName, " branchID ", branchID," difficulty ", difficulty,longestchain, " longestchain ",notarized," notarized ")
+
+	// Get the Coinsupply from the RPC
+	 result, coin, height, supply, zfunds, total, err := common.GetCoinsupply(rpcClient)
+	if err != nil {
+		log.WithFields(logrus.Fields{
+			"error": err,
+		}).Warn("Unable to get coinsupply")
+	}
+
+	log.Info( " result ", result, " coin ", coin," height", height, "supply", supply ,"zfunds", zfunds, "total", total)
 
 	// Initialize the cache
 	cache := common.NewBlockCache(opts.cacheSize)
