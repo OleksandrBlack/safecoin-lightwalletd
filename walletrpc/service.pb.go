@@ -731,7 +731,7 @@ type CompactTxStreamerClient interface {
 	GetAddressTxids(ctx context.Context, in *TransparentAddressBlockFilter, opts ...grpc.CallOption) (CompactTxStreamer_GetAddressTxidsClient, error)
 	// Misc
 	GetLightdInfo(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*LightdInfo, error)
-	GetWalletInfo(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*GetWalletInfo, error)
+	GetWalletInfo(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*WalletInfo, error)
 	GetCoinsupply(ctx context.Context, in *Empty, opts ...grpc.CallOption) (*Coinsupply, error)
 }
 
