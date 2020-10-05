@@ -431,7 +431,7 @@ func (s *SqlStreamer) GetLightdInfo(ctx context.Context, in *walletrpc.Empty) (*
 }
 
 // GetWalletInfo
-func (s *SqlStreamer) GetLightdInfo(ctx context.Context, in *walletrpc.Empty) (*walletrpc.WalletInfo, error) {
+func (s *SqlStreamer) GetWalletInfo(ctx context.Context, in *walletrpc.Empty) (*walletrpc.WalletInfo, error) {
 
 	difficulty, longestchain, notarized, err := common.GetWalletInfo(s.client)
 
