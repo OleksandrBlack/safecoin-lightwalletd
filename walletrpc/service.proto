@@ -89,5 +89,6 @@ service CompactTxStreamer {
 
     // Misc
     rpc GetLightdInfo(Empty) returns (LightdInfo) {}
+    rpc GetWalletInfo(Empty) returns (WalletInfo) {}
     rpc GetCoinsupply(Empty) returns (Coinsupply) {}
 }

@@ -3,15 +3,20 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/reflection"
 
@@ -23,6 +28,12 @@ import (
 var log *logrus.Entry
 var logger = logrus.New()
 
+var (
+	promRegistry = prometheus.NewRegistry()
+)
+
+var metrics = common.GetPrometheusMetrics()
+
 func init() {
 	logger.SetFormatter(&logrus.TextFormatter{
 		//DisableColors:          true,
@@ -33,6 +44,13 @@ func init() {
 	log = logger.WithFields(logrus.Fields{
 		"app": "frontend-grpc",
 	})
+
+	promRegistry.MustRegister(metrics.LatestBlockCounter)
+	promRegistry.MustRegister(metrics.TotalErrors)
+	promRegistry.MustRegister(metrics.TotalBlocksServedConter)
+	promRegistry.MustRegister(metrics.SendTransactionsCounter)
+	promRegistry.MustRegister(metrics.TotalSaplingParamsCounter)
+	promRegistry.MustRegister(metrics.TotalSproutParamsCounter)
 }
 
 // TODO stream logging
@@ -68,22 +86,31 @@ func logInterceptor(
 }
 
 func loggerFromContext(ctx context.Context) *logrus.Entry {
-	// TODO: anonymize the addresses. cryptopan?
+	if xRealIP, ok := metadata.FromIncomingContext(ctx); ok {
+		realIP := xRealIP.Get("x-real-ip")
+		if len(realIP) > 0 {
+			return log.WithFields(logrus.Fields{"peer_addr": realIP[0]})
+		}
+	}
+
 	if peerInfo, ok := peer.FromContext(ctx); ok {
 		return log.WithFields(logrus.Fields{"peer_addr": peerInfo.Addr})
 	}
+
 	return log.WithFields(logrus.Fields{"peer_addr": "unknown"})
 }
 
 type Options struct {
-	bindAddr      string `json:"bind_address,omitempty"`
-	tlsCertPath   string `json:"tls_cert_path,omitempty"`
-	tlsKeyPath    string `json:"tls_cert_key,omitempty"`
-	noTLS         bool   `json:no_tls,omitempty`
-	logLevel      uint64 `json:"log_level,omitempty"`
-	logPath       string `json:"log_file,omitempty"`
-	zcashConfPath string `json:"zcash_conf,omitempty"`
-	cacheSize     int    `json:"cache_size,omitempty"`
+	bindAddr      string
+	tlsCertPath   string
+	tlsKeyPath    string
+	noTLS         bool
+	logLevel      uint64
+	logPath       string
+	zcashConfPath string
+	cacheSize     int
+	metricsPort   uint
+	paramsPort    uint
 }
 
 func main() {
@@ -96,6 +123,8 @@ func main() {
 	flag.StringVar(&opts.logPath, "log-file", "", "log file to write to")
 	flag.StringVar(&opts.zcashConfPath, "conf-file", "", "conf file to pull RPC creds from")
 	flag.IntVar(&opts.cacheSize, "cache-size", 40000, "number of blocks to hold in the cache")
+	flag.UintVar(&opts.paramsPort, "params-port", 8090, "the port on which the params server listens")
+	flag.UintVar(&opts.metricsPort, "metrics-port", 2234, "the port on which to run the prometheus metrics exported")
 
 	// TODO prod metrics
 	// TODO support config from file and env vars
@@ -170,14 +199,14 @@ func main() {
 	}
 
 	// Get the sapling activation height from the RPC
-	saplingHeight, blockHeight, chainName, branchID, difficulty, longestchain, notarized, err := common.GetSaplingInfo(rpcClient)
+	saplingHeight, blockHeight, chainName, branchID, err := common.GetSaplingInfo(rpcClient)
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"error": err,
 		}).Warn("Unable to get sapling activation height")
 	}
 
-	log.Info("Got sapling height ", saplingHeight, " chain ", chainName, " branchID ", branchID," difficulty ", difficulty,longestchain, " longestchain ",notarized," notarized ")
+	log.Info("Got sapling height ", saplingHeight, " chain ", chainName, " branchID ", branchID)
 
 	// Get the Coinsupply from the RPC
 	 result, coin, height, supply, zfunds, total, err := common.GetCoinsupply(rpcClient)
@@ -189,21 +218,68 @@ func main() {
 
 	log.Info( " result ", result, " coin ", coin," height", height, "supply", supply ,"zfunds", zfunds, "total", total)
 
+	// Get the walletinfo from the RPC
+	difficulty, longestchain, notarized, err := common.GetWalletInfo(rpcClient)
+	if err != nil {
+		log.WithFields(logrus.Fields{
+			"error": err,
+		}).Warn("Unable to get walletinfo")
+	}
+
+	log.Info("difficulty ", difficulty," longestchain ", longestchain," notarized ", notarized)
+
 	// Initialize the cache
-	cache := common.NewBlockCache(opts.cacheSize)
+	cache := common.NewBlockCache(opts.cacheSize, log)
 
 	stopChan := make(chan bool, 1)
 
-	// Start the block cache importer at latestblock - 100k(cache size)
-	cacheStart := blockHeight - opts.cacheSize
+	// Start the block cache importer at 100 blocks, so that the server is ready immediately.
+	// The remaining blocks are added historically
+	cacheStart := blockHeight - 100
 	if cacheStart < saplingHeight {
 		cacheStart = saplingHeight
 	}
 
+	// Start the ingestor
 	go common.BlockIngestor(rpcClient, cache, log, stopChan, cacheStart)
 
+	// Add historical blocks also
+	go common.HistoricalBlockIngestor(rpcClient, cache, log, cacheStart-1, opts.cacheSize, saplingHeight)
+
+	// Signal handler for graceful stops
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		s := <-signals
+		log.WithFields(logrus.Fields{
+			"signal": s.String(),
+		}).Info("caught signal, stopping gRPC server")
+		// Stop the server
+		server.GracefulStop()
+		// Stop the block ingestor
+		stopChan <- true
+	}()
+
+	// Start the metrics server
+	go func() {
+		http.Handle("/metrics", promhttp.HandlerFor(
+			promRegistry,
+			promhttp.HandlerOpts{},
+		))
+		metricsport := fmt.Sprintf(":%d", opts.metricsPort)
+		log.Fatal(http.ListenAndServe(metricsport, nil))
+	}()
+
+	// Start the download params handler
+	log.Infof("Starting params handler")
+	paramsport := fmt.Sprintf(":%d", opts.paramsPort)
+	go common.ParamsDownloadHandler(metrics, log, paramsport)
+
+	// Start the GRPC server
+	log.Infof("Starting gRPC server on %s", opts.bindAddr)
+
 	// Compact transaction service initialization
-	service, err := frontend.NewSQLiteStreamer(rpcClient, cache, log)
+	service, err := frontend.NewSQLiteStreamer(rpcClient, cache, log, metrics)
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"error": err,
@@ -222,22 +298,6 @@ func main() {
 			"error":     err,
 		}).Fatal("couldn't create listener")
 	}
-
-	// Signal handler for graceful stops
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		s := <-signals
-		log.WithFields(logrus.Fields{
-			"signal": s.String(),
-		}).Info("caught signal, stopping gRPC server")
-		// Stop the server
-		server.GracefulStop()
-		// Stop the block ingestor
-		stopChan <- true
-	}()
-
-	log.Infof("Starting gRPC server on %s", opts.bindAddr)
 
 	err = server.Serve(listener)
 	if err != nil {

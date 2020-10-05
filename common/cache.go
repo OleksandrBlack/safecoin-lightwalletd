@@ -2,10 +2,13 @@ package common
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 
 	"github.com/OleksandrBlack/safecoin-lightwalletd/walletrpc"
 	"github.com/golang/protobuf/proto"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type BlockCacheEntry struct {
@@ -21,16 +24,55 @@ type BlockCache struct {
 
 	m map[int]*BlockCacheEntry
 
+	log   *logrus.Entry
 	mutex sync.RWMutex
 }
 
-func NewBlockCache(maxEntries int) *BlockCache {
+func NewBlockCache(maxEntries int, log *logrus.Entry) *BlockCache {
 	return &BlockCache{
 		MaxEntries: maxEntries,
 		FirstBlock: -1,
 		LastBlock:  -1,
 		m:          make(map[int]*BlockCacheEntry),
+		log:        log,
+		mutex:      sync.RWMutex{},
 	}
+}
+
+func (c *BlockCache) AddHistorical(height int, block *walletrpc.CompactBlock) (error, bool) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	// If the cache is full, then we'll ignore this block
+	if c.LastBlock-c.FirstBlock+1 > c.MaxEntries {
+		return nil, true
+	}
+
+	// We can only add one block before the first block.
+	if height != c.FirstBlock-1 {
+		fmt.Printf("Can't add historical block out of order. adding %d, firstblock is %d", height, c.FirstBlock)
+		return errors.New("Incorrect historical block order"), false
+	}
+
+	// Add the entry and update the counters
+	data, err := proto.Marshal(block)
+	if err != nil {
+		println("Error marshalling block!")
+		return err, false
+	}
+
+	c.m[height] = &BlockCacheEntry{
+		data: data,
+		hash: block.GetHash(),
+	}
+	c.FirstBlock = height
+
+	c.log.WithFields(logrus.Fields{
+		"method": "CacheHistoricalBlock",
+		"block":  height,
+	}).Info("Cache")
+
+	return nil, false
 }
 
 func (c *BlockCache) Add(height int, block *walletrpc.CompactBlock) (error, bool) {
@@ -81,7 +123,11 @@ func (c *BlockCache) Add(height int, block *walletrpc.CompactBlock) (error, bool
 		c.FirstBlock = c.FirstBlock + 1
 	}
 
-	//println("Cache size is ", len(c.m))
+	c.log.WithFields(logrus.Fields{
+		"method": "CacheLatestBlock",
+		"block":  height,
+	}).Info("Cache")
+
 	return nil, false
 }
 
